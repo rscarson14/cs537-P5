@@ -3,13 +3,16 @@
 USER_PROGS := \
 	cat\
 	echo\
+	filestat\
 	forktest\
+	ecwrite\
 	grep\
 	init\
 	kill\
 	ln\
 	ls\
 	mkdir\
+	mirrortest\
 	rm\
 	sh\
 	stressfs\

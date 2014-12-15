@@ -1,3 +1,4 @@
+
 // File system implementation.  Four layers:
 //   + Blocks: allocator for raw disk blocks.
 //   + Files: inode allocator, reading, writing, metadata.
@@ -20,6 +21,10 @@
 #include "buf.h"
 #include "fs.h"
 #include "file.h"
+
+#define ORIG 0
+#define MIR 1
+#define RES 2
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 static void itrunc(struct inode*);
@@ -56,7 +61,6 @@ balloc(uint dev)
   int b, bi, m;
   struct buf *bp;
   struct superblock sb;
-
   bp = 0;
   readsb(dev, &sb);
   for(b = 0; b < sb.size; b += BPB){
@@ -64,10 +68,10 @@ balloc(uint dev)
     for(bi = 0; bi < BPB; bi++){
       m = 1 << (bi % 8);
       if((bp->data[bi/8] & m) == 0){  // Is block free?
-        bp->data[bi/8] |= m;  // Mark block in use on disk.
-        bwrite(bp);
-        brelse(bp);
-        return b + bi;
+	bp->data[bi/8] |= m;  // Mark block in use on disk.
+	bwrite(bp);
+	brelse(bp);
+	return b + bi;
       }
     }
     brelse(bp);
@@ -317,32 +321,72 @@ iunlockput(struct inode *ip)
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
 static uint
-bmap(struct inode *ip, uint bn)
+bmap(struct inode *ip, uint bn, uint cpy)
 {
   uint addr, *a;
   struct buf *bp;
 
-  if(bn < NDIRECT){
-    if((addr = ip->addrs[bn]) == 0)
-      ip->addrs[bn] = addr = balloc(ip->dev);
-    return addr;
-  }
-  bn -= NDIRECT;
+  //cprintf("bmap - block number = %d\n", bn);
+  // Or Mir Res bn
+  // 0  1    2   0
+  // 3  4    5   1 
+  // 6  7    8   2 
+  // 9  10   11  3
 
-  if(bn < NINDIRECT){
-    // Load indirect block, allocating if necessary.
-    if((addr = ip->addrs[NDIRECT]) == 0)
-      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
-    bp = bread(ip->dev, addr);
-    a = (uint*)bp->data;
-    if((addr = a[bn]) == 0){
-      a[bn] = addr = balloc(ip->dev);
-      bwrite(bp);
+  /* p5 */
+  if(ip->type == T_MIRRORED){
+    if(cpy == ORIG)
+      bn = bn*3;
+    else if(cpy == MIR)
+      bn = bn*3 + 1;
+    else
+      bn = bn*3 + 2;
+    //cprintf("bmap : bn = %d\n", bn);
+    if(bn < NDIRECT){
+      if((addr = ip->addrs[bn]) == 0)
+	ip->addrs[bn] = addr = balloc(ip->dev);
+      return addr;
     }
-    brelse(bp);
-    return addr;
-  }
+    bn -= NDIRECT;
 
+    if(bn < NINDIRECT){
+      //cprintf("bmap - indirect block\n");
+      // Load indirect block, allocating if necessary.
+      if((addr = ip->addrs[NDIRECT]) == 0)
+	ip->addrs[NDIRECT] = addr = balloc(ip->dev);
+      bp = bread(ip->dev, addr);
+      a = (uint*)bp->data;
+      if((addr = a[bn]) == 0){
+	a[bn] = addr = balloc(ip->dev);
+	bwrite(bp);
+      }
+      brelse(bp);
+      return addr;
+    }
+  }
+  else{
+    if(bn < NDIRECT){
+      if((addr = ip->addrs[bn]) == 0)
+	ip->addrs[bn] = addr = balloc(ip->dev);
+      return addr;
+    }
+    bn -= NDIRECT;
+
+    if(bn < NINDIRECT){
+      //cprintf("bmap - indirect block\n");
+      // Load indirect block, allocating if necessary.
+      if((addr = ip->addrs[NDIRECT]) == 0)
+	ip->addrs[NDIRECT] = addr = balloc(ip->dev);
+      bp = bread(ip->dev, addr);
+      a = (uint*)bp->data;
+      if((addr = a[bn]) == 0){
+	a[bn] = addr = balloc(ip->dev);
+	bwrite(bp);
+      }
+      brelse(bp);
+      return addr;
+    }
+  }
   panic("bmap: out of range");
 }
 
@@ -362,7 +406,6 @@ itrunc(struct inode *ip)
       ip->addrs[i] = 0;
     }
   }
-  
   if(ip->addrs[NDIRECT]){
     bp = bread(ip->dev, ip->addrs[NDIRECT]);
     a = (uint*)bp->data;
@@ -387,7 +430,12 @@ stati(struct inode *ip, struct stat *st)
   st->ino = ip->inum;
   st->type = ip->type;
   st->nlink = ip->nlink;
-  st->size = ip->size;
+  st->logical_size = ip->size;
+    /* p5 */
+  if(ip->type == T_MIRRORED)
+    st->physical_size = 3*ip->size;
+  else
+    st->physical_size = ip->size;
 }
 
 // Read data from inode.
@@ -395,7 +443,7 @@ int
 readi(struct inode *ip, char *dst, uint off, uint n)
 {
   uint tot, m;
-  struct buf *bp;
+  struct buf *bp, *bpm, *bpr;
 
   if(ip->type == T_DEV){
     if(ip->major < 0 || ip->major >= NDEV || !devsw[ip->major].read)
@@ -409,10 +457,89 @@ readi(struct inode *ip, char *dst, uint off, uint n)
     n = ip->size - off;
 
   for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
-    bp = bread(ip->dev, bmap(ip, off/BSIZE));
-    m = min(n - tot, BSIZE - off%BSIZE);
-    memmove(dst, bp->data + off%BSIZE, m);
-    brelse(bp);
+    /* p5 */
+    if(ip->type == T_MIRRORED){
+     
+      //cprintf("readi : T_MIRRORED off/BSIZE = %d \n", off/BSIZE);
+      uint addr =  bmap(ip, off/BSIZE, ORIG);
+      uint mirror = bmap(ip, off/BSIZE, MIR);
+      uint reserve = bmap(ip, off/BSIZE, RES);
+      
+      int comp[3] = {0, 0, 0};
+      
+      // read the normal file block
+      bp = bread(ip->dev, addr);
+      m = min(n - tot, BSIZE - off%BSIZE);
+      //      memmove(dst, bp->data + off%BSIZE, m);
+
+      // read the mirrored block
+      bpm = bread(ip->dev, mirror);
+      m = min(n - tot, BSIZE - off%BSIZE);
+      
+      // read the reserve block
+      bpr = bread(ip->dev, reserve);
+      m = min(n - tot, BSIZE - off%BSIZE);
+      
+
+      // 0 is   and 2
+      // 1 is 1 and 3
+      // 2 is 2 and 3
+      int compVal = 0;
+      compVal = memcmp(bp->data, bpm->data, m);
+      if(compVal < 0) comp[0] += compVal * -1;
+      else comp[0] += compVal;
+      
+      compVal = memcmp(bp->data, bpr->data, m);
+      if(compVal < 0) comp[1] += compVal * -1;
+      else comp[1] += compVal;
+
+      compVal = memcmp(bpm->data, bpr->data, m);
+      if(compVal < 0) comp[2] += compVal * -1;
+      else comp[2] += compVal;
+
+      cprintf("comp results %d, %d, %d\n", comp[0], comp[1], comp[2]);
+      
+      int i;
+      int max, index, z;
+      max = index = z  = -1;
+      for(i = 0; i < 3; i++){
+	if(comp[i] > max){
+	  //cprintf("updating index and max\n");
+	  index = i;
+	  max = comp[i];
+	}
+	if(comp[i] == 0){
+	  z = i;
+	}
+      }
+
+      cprintf("max = %d, index = %d\n", max, index);
+      if(comp[0] + comp[1] + comp[2] == 0){
+	//cprintf("readi - Mirrored copies work\n");
+	memmove(dst, bp->data + off%BSIZE, m); // equal
+      }
+      else if(z == -1){
+	return -1;
+      }
+      else{
+	switch(z){
+	case 0: memmove(bpr->data + off%BSIZE, bp->data, m); bwrite(bp); break;
+	case 1: memmove(bpm->data + off%BSIZE, bp->data, m); bwrite(bpm); break;
+	case 2: memmove(bp->data + off%BSIZE, bpm->data, m); bwrite(bpr); break;
+	default: panic("readi - replacing data - should never be here"); break;
+	}
+      }
+      
+      brelse(bpr);
+      brelse(bp);
+      brelse(bpm);
+    }
+    else{
+      bp = bread(ip->dev, bmap(ip, off/BSIZE, 0));
+      m = min(n - tot, BSIZE - off%BSIZE);
+      memmove(dst, bp->data + off%BSIZE, m);
+      brelse(bp);
+    }
   }
   return n;
 }
@@ -422,7 +549,7 @@ int
 writei(struct inode *ip, char *src, uint off, uint n)
 {
   uint tot, m;
-  struct buf *bp;
+  struct buf *bp, *bpm, *bpr;
 
   if(ip->type == T_DEV){
     if(ip->major < 0 || ip->major >= NDEV || !devsw[ip->major].write)
@@ -436,11 +563,43 @@ writei(struct inode *ip, char *src, uint off, uint n)
     n = MAXFILE*BSIZE - off;
 
   for(tot=0; tot<n; tot+=m, off+=m, src+=m){
-    bp = bread(ip->dev, bmap(ip, off/BSIZE));
-    m = min(n - tot, BSIZE - off%BSIZE);
-    memmove(bp->data + off%BSIZE, src, m);
-    bwrite(bp);
-    brelse(bp);
+    /* p5 */
+    if(ip->type == T_MIRRORED){
+    
+      //cprintf("writei : T_MIRRORED \n");
+      uint addr =  bmap(ip, off/BSIZE, ORIG);
+      uint mAddr = bmap(ip, off/BSIZE, MIR);
+      uint rAddr = bmap(ip, off/BSIZE, RES);
+
+      //cprintf("writei : addr = %d, mAddr = %d\n", addr, mAddr);
+      bp = bread(ip->dev, addr);
+      m = min(n - tot, BSIZE - off%BSIZE);
+ 
+      bpm = bread(ip->dev, mAddr);
+      m = min(n - tot, BSIZE - off%BSIZE);
+
+      bpr = bread(ip->dev, rAddr);
+      m = min(n - tot, BSIZE - off%BSIZE);
+
+      memmove(bp->data + off%BSIZE, src, m);
+      memmove(bpm->data + off%BSIZE, src, m);
+      memmove(bpr->data + off%BSIZE, src, m);
+ 
+      bwrite(bp);
+      bwrite(bpm);
+      bwrite(bpr);
+
+      brelse(bp);
+      brelse(bpm);
+      brelse(bpr);
+    }
+    else{
+      bp = bread(ip->dev, bmap(ip, off/BSIZE, 0));
+      m = min(n - tot, BSIZE - off%BSIZE);
+      memmove(bp->data + off%BSIZE, src, m);
+      bwrite(bp);
+      brelse(bp);
+    }
   }
 
   if(n > 0 && off > ip->size){
@@ -472,7 +631,7 @@ dirlookup(struct inode *dp, char *name, uint *poff)
     panic("dirlookup not DIR");
 
   for(off = 0; off < dp->size; off += BSIZE){
-    bp = bread(dp->dev, bmap(dp, off / BSIZE));
+    bp = bread(dp->dev, bmap(dp, off / BSIZE, 0));
     for(de = (struct dirent*)bp->data;
         de < (struct dirent*)(bp->data + BSIZE);
         de++){

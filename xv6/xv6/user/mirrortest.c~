@@ -1,0 +1,49 @@
+// Do not modify this file. It will be replaced by the grading scripts
+// when checking your project.
+
+#include "types.h"
+#include "stat.h"
+#include "user.h"
+#include "fs.h"
+#include "fcntl.h"
+
+int
+main(int argc, char *argv[])
+{
+
+  char *pathname;
+  char *data;
+  int fd;
+  int i;
+  int seed;
+
+  if(argc != 3){
+    printf(1, "Usage: filestat <pathname> <seed>\n");
+    exit();
+  }
+
+  pathname = argv[1];
+  seed = atoi(argv[2]);
+  
+  fd = open(pathname, O_MIRRORED | O_CREATE |  O_RDWR);
+  if(fd < 0){
+    printf(1, "Error opening file %s\n", pathname);
+    exit();
+  }
+
+  data = (char *) malloc(seed);
+
+  for(i = 0; i < seed; i++){
+    data[i] = 'Z';
+  }
+
+  printf(1, "maxfile = %d\n", (MAXFILE));
+
+  data[seed-1] = '\0';
+
+  i = write(fd, data, seed);
+  
+  free(data);
+  close(fd);
+  exit();
+}
